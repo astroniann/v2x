@@ -1,12 +1,12 @@
 import 'package:latlong2/latlong.dart';
 
 /// Represents a static pedestrian on the road (not moving)
-/// Positioned at a real road location using OSRM snapping
+/// Positioned at a real road location
 class StaticPedestrian {
   final String id;
-  final LatLng roadLocation; // Position snapped to actual road
-  bool isDetected; // Has vehicle detected this pedestrian?
-  double? lastDetectionDistance; // Last calculated distance in meters
+  final LatLng roadLocation;
+  bool isDetected;
+  double? lastDetectionDistance;
 
   StaticPedestrian({
     required this.id,

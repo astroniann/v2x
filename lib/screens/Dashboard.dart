@@ -1,17 +1,12 @@
 import 'dart:async';
-
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
 
 import '../services/api_service.dart';
-import '../models/RSU.dart' as rsu; // API pedestrian model
-import '../models/Pedestrian.dart'; // Local pedestrian model with PedestrianState
+import '../models/RSU.dart' as rsu;
 import '../models/StaticPedestrian.dart';
-import '../models/RealWorldRoadNetwork.dart';
-import '../services/pedestrian_manager.dart';
-import '../services/static_pedestrian_manager.dart';
 
 class MapScreen extends StatefulWidget {
   const MapScreen({super.key});
@@ -25,100 +20,77 @@ class _MapScreenState extends State<MapScreen> {
   late final MapController _mapController;
   final ApiService _apiService = ApiService();
 
-  // Static pedestrian system (NEW - replaces dynamic pedestrian manager)
-  late StaticPedestrianManager _staticPedestrianManager;
-  List<PedestrianAlert> _activeAlerts = [];
-  static const int _maxAlertsShown = 10;
-
-  // Live GPS stream subscription
-  StreamSubscription<Position>? _positionSub;
-
-  // Fallback location (Ahmedabad, India)
-  final LatLng _fallbackCenter = const LatLng(23.0225, 72.5714);
+  // Pedestrians list
+  final List<StaticPedestrian> _pedestrians = [];
+  final List<PedestrianAlertData> _activeAlerts = [];
   
-  // Map bounds for Ahmedabad area (rough approximation)
-  static const double _mapLatMin = 22.95;
-  static const double _mapLatMax = 23.15;
-  static const double _mapLonMin = 72.45;
-  static const double _mapLonMax = 72.65;
+  StreamSubscription<Position>? _positionSub;
+  Timer? _distanceCheckTimer;
+
+  final LatLng _fallbackCenter = const LatLng(23.0225, 72.5714);
+  static const double _collisionThresholdMeters = 2000.0; // 2km alert range
 
   @override
   void initState() {
     super.initState();
     _mapController = MapController();
-
-    // Create realistic Ahmedabad road network
-    final roadNetwork = RealWorldRoadNetwork.createAhmedabadNetwork();
-
-    // Initialize static pedestrian manager with real road network
-    _staticPedestrianManager = StaticPedestrianManager(
-      roadNetwork: roadNetwork,
-      mapBoundsLatMin: _mapLatMin,
-      mapBoundsLatMax: _mapLatMax,
-      mapBoundsLonMin: _mapLonMin,
-      mapBoundsLonMax: _mapLonMax,
-      collisionThresholdMeters: 2000.0, // 2km alert threshold for real roads
-    );
-
-    // Set up callbacks
-    _staticPedestrianManager.onAlertTriggered = _handlePedestrianAlert;
-    _staticPedestrianManager.onPedestriansUpdated = (peds) {
-      setState(() {
-        // UI will update to show detected pedestrians
-      });
-    };
-
-    // Ask permission + start live GPS as soon as this screen runs
     _initLocation();
-
-    // Fetch pedestrians from backend
-    _fetchPedestrians();
+    _fetchPedestriansFromBackend();
   }
 
   @override
   void dispose() {
     _positionSub?.cancel();
-    _staticPedestrianManager.dispose();
+    _distanceCheckTimer?.cancel();
     super.dispose();
   }
 
-  // Full location init: permission + initial position + live stream
+  // Initialize GPS location
   Future<void> _initLocation() async {
     final hasPermission = await _handleLocationPermission();
     if (!hasPermission) return;
 
-    // Get initial position once (so we can center quickly)
     try {
+      // Get initial position
       final pos = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.high,
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+          timeLimit: Duration(seconds: 10),
+        ),
       );
 
       setState(() {
         _currentLocation = LatLng(pos.latitude, pos.longitude);
       });
 
-      // Spawn static pedestrians on roads + 1 test pedestrian within threshold
-      _showMsg('👥 Spawning static pedestrians on road network...');
-      _staticPedestrianManager.spawnStaticPedestrians(5);
-      _staticPedestrianManager.spawnTestPedestrianNearby(_currentLocation!);
-      _showMsg('✓ ${_staticPedestrianManager.pedestrians.length} pedestrians placed on roads');
+      debugPrint('✅ Initial location: ${pos.latitude}, ${pos.longitude}');
 
+      // Center map on user location
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        _mapController.move(_currentLocation!, 17);
+        _mapController.move(_currentLocation!, 15);
       });
+
+      // Start distance checking
+      _startDistanceChecking();
+
     } catch (e) {
-      debugPrint('Error getting initial position: $e');
+      debugPrint('❌ Error getting location: $e');
+      setState(() {
+        _currentLocation = _fallbackCenter;
+      });
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _mapController.move(_fallbackCenter, 15);
+      });
     }
 
-    // Start live GPS stream (real-time updates)
+    // Live GPS tracking
     _positionSub = Geolocator.getPositionStream(
       locationSettings: const LocationSettings(
-        accuracy: LocationAccuracy.best,
-        distanceFilter: 0, // update on every movement (for testing)
+        accuracy: LocationAccuracy.high,
+        distanceFilter: 5, // Update every 5 meters
       ),
     ).listen((Position position) {
-      debugPrint(
-          'New live position: ${position.latitude}, ${position.longitude}');
+      debugPrint('📍 GPS Update: ${position.latitude}, ${position.longitude}');
 
       final newLoc = LatLng(position.latitude, position.longitude);
 
@@ -126,107 +98,209 @@ class _MapScreenState extends State<MapScreen> {
         _currentLocation = newLoc;
       });
 
-      // Detect pedestrians on roads (OSRM-based distance calculation)
-      _staticPedestrianManager.detectPedestriansFromVehicle(newLoc);
-
-      // Update vehicle location on backend API
+      // Send location to backend
       _apiService.updateLocation(position.latitude, position.longitude);
 
+      // Update map
       WidgetsBinding.instance.addPostFrameCallback((_) {
         try {
-          _mapController.move(newLoc, 17);
+          _mapController.move(newLoc, _mapController.camera.zoom);
         } catch (e) {
-          debugPrint('MapController move skipped: $e');
+          debugPrint('Map update error: $e');
         }
       });
     });
   }
 
-  // Handle location permission + service
+  // Handle location permissions
   Future<bool> _handleLocationPermission() async {
-    // 1) Check if location services are enabled
     final serviceEnabled = await Geolocator.isLocationServiceEnabled();
     if (!serviceEnabled) {
-      _showMsg("Please enable location services (GPS).");
+      debugPrint('⚠️ Location services disabled');
       return false;
     }
 
-    // 2) Check existing permission
     LocationPermission permission = await Geolocator.checkPermission();
 
     if (permission == LocationPermission.denied) {
-      // Ask the user when app/screen runs
       permission = await Geolocator.requestPermission();
       if (permission == LocationPermission.denied) {
-        _showMsg("Location permission denied.");
+        debugPrint('⚠️ Location permission denied');
         return false;
       }
     }
 
     if (permission == LocationPermission.deniedForever) {
-      _showMsg(
-        "Location permission permanently denied. "
-        "Please enable it from Settings.",
-      );
+      debugPrint('⚠️ Location permission permanently denied');
       return false;
     }
 
-    // Granted (while in use / always)
     return true;
   }
 
-  // Fetch pedestrian data from API (legacy - now uses local road network spawning)
-  Future<void> _fetchPedestrians() async {
+  // Fetch pedestrians from backend
+  Future<void> _fetchPedestriansFromBackend() async {
     try {
       final List<rsu.Pedestrian> data = await _apiService.fetchPedestrians();
-      debugPrint('📡 Fetched ${data.length} pedestrians from API');
-      // Now using local spawning on road network, so no need to store API pedestrians
+      debugPrint('📡 Fetched ${data.length} pedestrians from backend');
+
+      setState(() {
+        _pedestrians.clear();
+        for (final p in data) {
+          _pedestrians.add(StaticPedestrian(
+            id: p.id,
+            roadLocation: LatLng(p.lat, p.lon),
+            isDetected: false,
+          ));
+        }
+      });
+
+      // Start checking distances
+      if (_currentLocation != null) {
+        _checkAllPedestrianDistances();
+      }
     } catch (e) {
-      debugPrint('Error fetching pedestrians: $e');
-      // Not critical - local pedestrians still spawn
+      debugPrint('❌ Error fetching pedestrians: $e');
     }
   }
 
-  // Handle pedestrian collision alerts
-  void _handlePedestrianAlert(PedestrianAlert alert) {
+  // Spawn proxy pedestrian on map (for testing)
+  Future<void> _spawnProxyPedestrian() async {
+    if (_currentLocation == null) {
+      debugPrint('⚠️ Current location not available');
+      return;
+    }
+
+    // Create a pedestrian at a random nearby location (within ~5km)
+    final random = (DateTime.now().millisecondsSinceEpoch % 1000) / 1000.0;
+    final offset = (random - 0.5) * 0.05; // Random offset
+    
+    final testLat = _currentLocation!.latitude + offset;
+    final testLon = _currentLocation!.longitude + offset;
+
+    final testLocation = LatLng(testLat, testLon);
+
+    // Snap to nearest road
+    debugPrint('📍 Spawning pedestrian near (${testLat.toStringAsFixed(5)}, ${testLon.toStringAsFixed(5)})');
+    final snappedLocation = await _apiService.snapToRoad(testLocation);
+    final finalLocation = snappedLocation ?? testLocation;
+
+    final proxyPed = StaticPedestrian(
+      id: 'ped_${DateTime.now().millisecondsSinceEpoch}',
+      roadLocation: finalLocation,
+      isDetected: false,
+    );
+
     setState(() {
-      // Track active alerts, max 10 shown
-      _activeAlerts.insert(0, alert);
-      if (_activeAlerts.length > _maxAlertsShown) {
-        _activeAlerts.removeLast();
-      }
+      _pedestrians.add(proxyPed);
     });
 
-    final distanceKm = alert.distanceMetersToCollision / 1000.0;
-    final msg = alert.isNewAlert
-        ? '🚨 NEW ALERT: ${alert.pedestrianId}\nDistance: ${alert.distanceMetersToCollision.toStringAsFixed(1)}m (${distanceKm.toStringAsFixed(2)}km)'
-        : '📍 UPDATE: ${alert.pedestrianId}\nDistance: ${alert.distanceMetersToCollision.toStringAsFixed(1)}m';
+    debugPrint('✅ Spawned pedestrian at (${finalLocation.latitude.toStringAsFixed(5)}, ${finalLocation.longitude.toStringAsFixed(5)})');
 
-    debugPrint(
-        '🚨 COLLISION ALERT: ${alert.pedestrianId} at ${alert.distanceMetersToCollision.toStringAsFixed(1)}m (NEW: ${alert.isNewAlert})');
-
-    // Show prominent alert
-    if (alert.isNewAlert) {
-      _showMsg(msg);
-    }
-
-    // Send alert to backend API
-    _apiService.updatePedestrian(
-      alert.pedestrianLocation.latitude,
-      alert.pedestrianLocation.longitude,
-      pedestrianId: alert.pedestrianId,
-    );
+    // Calculate distance immediately
+    await _checkPedestrianDistance(proxyPed);
   }
 
-  void _showMsg(String msg) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(msg),
-        duration: const Duration(seconds: 5),
-        backgroundColor: Colors.red,
-      ),
-    );
+  // Spawn multiple pedestrians
+  Future<void> _spawnMultiplePedestrians(int count) async {
+    if (_currentLocation == null) {
+      debugPrint('⚠️ Current location not available');
+      return;
+    }
+
+    debugPrint('👥 Spawning $count pedestrians...');
+    
+    for (int i = 0; i < count; i++) {
+      await _spawnProxyPedestrian();
+      // Small delay to avoid rate limiting
+      await Future.delayed(const Duration(milliseconds: 200));
+    }
+    
+    debugPrint('✅ Spawned $count pedestrians');
+  }
+
+  // Start periodic distance checking (every 2 seconds)
+  void _startDistanceChecking() {
+    _distanceCheckTimer?.cancel();
+    _distanceCheckTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (_currentLocation != null) {
+        _checkAllPedestrianDistances();
+      }
+    });
+  }
+
+  // Check distance to all pedestrians using REAL API
+  Future<void> _checkAllPedestrianDistances() async {
+    if (_currentLocation == null || _pedestrians.isEmpty) return;
+
+    debugPrint('🔍 Checking distances to ${_pedestrians.length} pedestrians...');
+
+    for (final ped in _pedestrians) {
+      await _checkPedestrianDistance(ped);
+    }
+  }
+
+  // Check distance to single pedestrian using REAL OSRM API
+  Future<void> _checkPedestrianDistance(StaticPedestrian ped) async {
+    if (_currentLocation == null) return;
+
+    try {
+      // Calculate REAL road distance using OSRM API
+      final proximityResult = await _apiService.checkPedestrianProximity(
+        _currentLocation!,
+        ped.roadLocation,
+        _collisionThresholdMeters,
+      );
+
+      if (proximityResult.error != null) {
+        debugPrint('⚠️ ${ped.id}: ${proximityResult.error}');
+        return;
+      }
+
+      // Update pedestrian data
+      setState(() {
+        ped.lastDetectionDistance = proximityResult.distanceMeters;
+
+        if (proximityResult.isNearby) {
+          // Pedestrian is within threshold - ALERT!
+          if (!ped.isDetected) {
+            // New alert
+            ped.isDetected = true;
+            
+            final alert = PedestrianAlertData(
+              pedestrianId: ped.id,
+              pedestrianLocation: ped.roadLocation,
+              distanceMeters: proximityResult.distanceMeters,
+              durationSeconds: proximityResult.durationSeconds,
+              detectionTime: DateTime.now(),
+              isNew: true,
+            );
+
+            _activeAlerts.insert(0, alert);
+            if (_activeAlerts.length > 10) {
+              _activeAlerts.removeLast();
+            }
+
+            // Send alert to backend
+            _apiService.updatePedestrian(
+              ped.roadLocation.latitude,
+              ped.roadLocation.longitude,
+              pedestrianId: ped.id,
+            );
+
+            debugPrint('🚨 NEW ALERT: ${ped.id} at ${proximityResult.distanceMeters.toStringAsFixed(0)}m');
+          }
+        } else {
+          // Pedestrian is far - clear alert
+          if (ped.isDetected) {
+            ped.isDetected = false;
+            debugPrint('✓ ${ped.id} moved out of range');
+          }
+        }
+      });
+    } catch (e) {
+      debugPrint('❌ Error checking ${ped.id}: $e');
+    }
   }
 
   @override
@@ -237,37 +311,51 @@ class _MapScreenState extends State<MapScreen> {
         backgroundColor: Colors.blue,
         actions: [
           IconButton(
+            icon: const Icon(Icons.person_add),
+            tooltip: 'Add 1 Pedestrian',
+            onPressed: _spawnProxyPedestrian,
+          ),
+          IconButton(
+            icon: const Icon(Icons.group_add),
+            tooltip: 'Add 5 Pedestrians',
+            onPressed: () => _spawnMultiplePedestrians(5),
+          ),
+          IconButton(
             icon: const Icon(Icons.refresh),
+            tooltip: 'Refresh from Backend',
+            onPressed: _fetchPedestriansFromBackend,
+          ),
+          IconButton(
+            icon: const Icon(Icons.delete_sweep),
+            tooltip: 'Clear All',
             onPressed: () {
-              _staticPedestrianManager.clearPedestrians();
-              _staticPedestrianManager.spawnStaticPedestrians(5);
-              setState(() {});
+              setState(() {
+                _pedestrians.clear();
+                _activeAlerts.clear();
+              });
             },
           ),
         ],
       ),
 
-      // Map always shows; uses fallback until GPS lock is ready
       body: Stack(
         children: [
+          // Map
           FlutterMap(
             mapController: _mapController,
             options: MapOptions(
               initialCenter: _currentLocation ?? _fallbackCenter,
-              initialZoom: 17,
+              initialZoom: 15,
             ),
             children: [
-              // Base map layer (OpenStreetMap)
               TileLayer(
-                urlTemplate:
-                    "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+                urlTemplate: "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
                 subdomains: ['a', 'b', 'c'],
               ),
 
-              // Markers layer: car (live GPS) + pedestrians (spawned)
               MarkerLayer(
                 markers: [
-                  // Car marker (only when GPS exists)
+                  // Vehicle marker
                   if (_currentLocation != null)
                     Marker(
                       width: 60,
@@ -292,94 +380,82 @@ class _MapScreenState extends State<MapScreen> {
                       ),
                     ),
 
-                  // Static pedestrian markers (on real roads, snapped via OSRM)
-                  ..._staticPedestrianManager.pedestrians.map(
-                    (ped) {
-                      final isDetected = ped.isDetected;
-                      final distance = ped.lastDetectionDistance ?? double.infinity;
-                      
-                      return Marker(
-                        width: 55,
-                        height: 55,
-                        point: ped.roadLocation,
-                        child: Stack(
-                          alignment: Alignment.center,
-                          children: [
-                            // Outer alert circle when detected
-                            if (isDetected)
-                              Container(
-                                width: 55,
-                                height: 55,
-                                decoration: BoxDecoration(
-                                  shape: BoxShape.circle,
-                                  border: Border.all(
-                                    color: Colors.red,
-                                    width: 3,
-                                  ),
-                                  boxShadow: [
-                                    BoxShadow(
-                                      color: Colors.red.withOpacity(0.7),
-                                      blurRadius: 15,
-                                      spreadRadius: 2,
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            // Main pedestrian icon
+                  // Pedestrian markers
+                  ..._pedestrians.map((ped) {
+                    final isDetected = ped.isDetected;
+                    final distance = ped.lastDetectionDistance ?? double.infinity;
+                    
+                    return Marker(
+                      width: 60,
+                      height: 60,
+                      point: ped.roadLocation,
+                      child: Stack(
+                        alignment: Alignment.center,
+                        children: [
+                          // Alert ring
+                          if (isDetected)
                             Container(
-                              width: 45,
-                              height: 45,
+                              width: 60,
+                              height: 60,
                               decoration: BoxDecoration(
-                                color: isDetected ? Colors.red : Colors.orange,
                                 shape: BoxShape.circle,
+                                border: Border.all(color: Colors.red, width: 3),
                                 boxShadow: [
                                   BoxShadow(
-                                    color: (isDetected ? Colors.red : Colors.orange)
-                                        .withOpacity(0.6),
-                                    blurRadius: isDetected ? 10 : 6,
+                                    color: Colors.red.withOpacity(0.7),
+                                    blurRadius: 15,
+                                    spreadRadius: 2,
                                   ),
                                 ],
                               ),
-                              child: Icon(
-                                Icons.person,
-                                color: Colors.white,
-                                size: isDetected ? 26 : 24,
-                              ),
                             ),
-                            // Distance badge when detected
-                            if (isDetected && distance != double.infinity)
-                              Positioned(
-                                bottom: -5,
-                                child: Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 6,
-                                    vertical: 2,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: Colors.red,
-                                    borderRadius: BorderRadius.circular(10),
-                                  ),
-                                  child: Text(
-                                    '${distance.toStringAsFixed(0)}m',
-                                    style: const TextStyle(
-                                      color: Colors.white,
-                                      fontSize: 9,
-                                      fontWeight: FontWeight.bold,
-                                    ),
+                          // Pedestrian icon
+                          Container(
+                            width: 45,
+                            height: 45,
+                            decoration: BoxDecoration(
+                              color: isDetected ? Colors.red : Colors.orange,
+                              shape: BoxShape.circle,
+                            ),
+                            child: const Icon(
+                              Icons.person,
+                              color: Colors.white,
+                              size: 26,
+                            ),
+                          ),
+                          // Distance badge
+                          if (distance != double.infinity)
+                            Positioned(
+                              bottom: -5,
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 6,
+                                  vertical: 2,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: isDetected ? Colors.red : Colors.orange,
+                                  borderRadius: BorderRadius.circular(10),
+                                ),
+                                child: Text(
+                                  '${(distance / 1000).toStringAsFixed(1)}km',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 9,
+                                    fontWeight: FontWeight.bold,
                                   ),
                                 ),
                               ),
-                          ],
-                        ),
-                      );
-                    },
-                  ),
+                            ),
+                        ],
+                      ),
+                    );
+                  }),
                 ],
               ),
             ],
           ),
 
-          // Alert panel (top-right) - Shows collision alerts
+          // Alert panel
           Positioned(
             top: 16,
             right: 16,
@@ -393,7 +469,6 @@ class _MapScreenState extends State<MapScreen> {
                   BoxShadow(
                     color: Colors.black.withOpacity(0.15),
                     blurRadius: 12,
-                    spreadRadius: 2,
                   ),
                 ],
                 border: Border.all(
@@ -414,7 +489,6 @@ class _MapScreenState extends State<MapScreen> {
                         style: const TextStyle(
                           fontSize: 14,
                           fontWeight: FontWeight.bold,
-                          color: Colors.black87,
                         ),
                       ),
                       if (_activeAlerts.isNotEmpty)
@@ -440,129 +514,96 @@ class _MapScreenState extends State<MapScreen> {
                   ),
                   const SizedBox(height: 10),
                   Flexible(
-                    child: SingleChildScrollView(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: _activeAlerts.isEmpty
-                            ? [
-                                Row(
-                                  children: [
-                                    const Icon(
-                                      Icons.check_circle,
-                                      color: Colors.green,
-                                      size: 20,
-                                    ),
-                                    const SizedBox(width: 8),
-                                    const Text(
-                                      '✓ No collision alerts',
-                                      style: TextStyle(
-                                        fontSize: 12,
-                                        color: Colors.green,
-                                        fontWeight: FontWeight.w500,
-                                      ),
-                                    ),
-                                  ],
+                    child: _activeAlerts.isEmpty
+                        ? const Row(
+                            children: [
+                              Icon(Icons.check_circle, color: Colors.green, size: 20),
+                              SizedBox(width: 8),
+                              Text(
+                                '✓ No collision alerts',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.green,
+                                  fontWeight: FontWeight.w500,
                                 ),
-                              ]
-                            : _activeAlerts
-                                .map(
-                                  (alert) => Padding(
-                                    padding: const EdgeInsets.only(bottom: 10),
-                                    child: Container(
-                                      padding: const EdgeInsets.all(10),
-                                      decoration: BoxDecoration(
-                                        color: Colors.red.withOpacity(0.08),
-                                        borderRadius: BorderRadius.circular(8),
-                                        border: Border.all(
-                                          color: Colors.red.withOpacity(0.4),
-                                          width: 2,
+                              ),
+                            ],
+                          )
+                        : SingleChildScrollView(
+                            child: Column(
+                              children: _activeAlerts.map((alert) {
+                                return Padding(
+                                  padding: const EdgeInsets.only(bottom: 10),
+                                  child: Container(
+                                    padding: const EdgeInsets.all(10),
+                                    decoration: BoxDecoration(
+                                      color: Colors.red.withOpacity(0.08),
+                                      borderRadius: BorderRadius.circular(8),
+                                      border: Border.all(
+                                        color: Colors.red.withOpacity(0.4),
+                                        width: 2,
+                                      ),
+                                    ),
+                                    child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Row(
+                                          children: [
+                                            const Text('🚨', style: TextStyle(fontSize: 14)),
+                                            const SizedBox(width: 6),
+                                            Expanded(
+                                              child: Text(
+                                                alert.pedestrianId,
+                                                style: const TextStyle(
+                                                  fontSize: 12,
+                                                  fontWeight: FontWeight.bold,
+                                                  color: Colors.red,
+                                                ),
+                                              ),
+                                            ),
+                                          ],
                                         ),
-                                      ),
-                                      child: Column(
-                                        crossAxisAlignment:
-                                            CrossAxisAlignment.start,
-                                        children: [
-                                          Row(
-                                            children: [
-                                              const Text(
-                                                '🚨',
-                                                style: TextStyle(fontSize: 14),
-                                              ),
-                                              const SizedBox(width: 6),
-                                              Expanded(
-                                                child: Text(
-                                                  alert.pedestrianId,
-                                                  style: const TextStyle(
-                                                    fontSize: 12,
-                                                    fontWeight: FontWeight.bold,
-                                                    color: Colors.red,
-                                                  ),
-                                                  overflow: TextOverflow.ellipsis,
-                                                ),
-                                              ),
-                                              if (alert.isNewAlert)
-                                                Container(
-                                                  padding: const EdgeInsets.symmetric(
-                                                    horizontal: 6,
-                                                    vertical: 2,
-                                                  ),
-                                                  decoration: BoxDecoration(
-                                                    color: Colors.red,
-                                                    borderRadius: BorderRadius.circular(4),
-                                                  ),
-                                                  child: const Text(
-                                                    'NEW',
-                                                    style: TextStyle(
-                                                      fontSize: 8,
-                                                      fontWeight: FontWeight.bold,
-                                                      color: Colors.white,
-                                                    ),
-                                                  ),
-                                                ),
-                                            ],
+                                        const SizedBox(height: 6),
+                                        Container(
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 8,
+                                            vertical: 4,
                                           ),
-                                          const SizedBox(height: 6),
-                                          Container(
-                                            padding: const EdgeInsets.symmetric(
-                                              horizontal: 8,
-                                              vertical: 4,
-                                            ),
-                                            decoration: BoxDecoration(
-                                              color: Colors.red,
-                                              borderRadius: BorderRadius.circular(4),
-                                            ),
-                                            child: Text(
-                                              '📍 ${alert.distanceMetersToCollision.toStringAsFixed(1)}m to collision',
-                                              style: const TextStyle(
-                                                fontSize: 11,
-                                                fontWeight: FontWeight.bold,
-                                                color: Colors.white,
-                                              ),
+                                          decoration: BoxDecoration(
+                                            color: Colors.red,
+                                            borderRadius: BorderRadius.circular(4),
+                                          ),
+                                          child: Text(
+                                            '📍 ${(alert.distanceMeters / 1000).toStringAsFixed(2)}km (${alert.distanceMeters.toStringAsFixed(0)}m)',
+                                            style: const TextStyle(
+                                              fontSize: 11,
+                                              fontWeight: FontWeight.bold,
+                                              color: Colors.white,
                                             ),
                                           ),
-                                          const SizedBox(height: 4),
-                                          Text(
-                                            'Detected: ${alert.detectionTime.hour.toString().padLeft(2, '0')}:${alert.detectionTime.minute.toString().padLeft(2, '0')}:${alert.detectionTime.second.toString().padLeft(2, '0')}',
-                                            style: TextStyle(
-                                              fontSize: 9,
-                                              color: Colors.red.withOpacity(0.7),
-                                            ),
+                                        ),
+                                        const SizedBox(height: 4),
+                                        Text(
+                                          'ETA: ${(alert.durationSeconds / 60).toStringAsFixed(1)} min',
+                                          style: TextStyle(
+                                            fontSize: 10,
+                                            color: Colors.red.withOpacity(0.7),
                                           ),
-                                        ],
-                                      ),
+                                        ),
+                                      ],
                                     ),
                                   ),
-                                )
-                                .toList(),
-                      ),
-                    ),
+                                );
+                              }).toList(),
+                            ),
+                          ),
                   ),
                 ],
               ),
             ),
           ),
 
-          // Stats panel (bottom-left)
+          // Stats panel
           Positioned(
             bottom: 16,
             left: 16,
@@ -574,7 +615,6 @@ class _MapScreenState extends State<MapScreen> {
                   BoxShadow(
                     color: Colors.black.withOpacity(0.15),
                     blurRadius: 12,
-                    spreadRadius: 2,
                   ),
                 ],
               ),
@@ -603,7 +643,7 @@ class _MapScreenState extends State<MapScreen> {
                       ),
                       const SizedBox(width: 8),
                       Text(
-                        'Pedestrians: ${_staticPedestrianManager.pedestrians.length}',
+                        'Pedestrians: ${_pedestrians.length}',
                         style: const TextStyle(fontSize: 11),
                       ),
                     ],
@@ -615,50 +655,32 @@ class _MapScreenState extends State<MapScreen> {
                         width: 12,
                         height: 12,
                         decoration: const BoxDecoration(
-                          color: Colors.blue,
+                          color: Colors.orange,
                           shape: BoxShape.circle,
                         ),
                       ),
                       const SizedBox(width: 8),
-                      Text(
-                        'Threshold: ${_staticPedestrianManager.collisionThresholdMeters.toStringAsFixed(0)}m',
-                        style: const TextStyle(fontSize: 11),
+                      const Text(
+                        'Using: OSRM Real Distance API',
+                        style: TextStyle(fontSize: 11),
                       ),
                     ],
                   ),
-                  const SizedBox(height: 6),
                   if (_currentLocation != null) ...[
+                    const SizedBox(height: 6),
                     Row(
                       children: [
                         Container(
                           width: 12,
                           height: 12,
                           decoration: const BoxDecoration(
-                            color: Colors.orange,
+                            color: Colors.blue,
                             shape: BoxShape.circle,
                           ),
                         ),
                         const SizedBox(width: 8),
                         Text(
-                          'Lat: ${_currentLocation!.latitude.toStringAsFixed(5)}',
-                          style: const TextStyle(fontSize: 10),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 4),
-                    Row(
-                      children: [
-                        Container(
-                          width: 12,
-                          height: 12,
-                          decoration: const BoxDecoration(
-                            color: Colors.orange,
-                            shape: BoxShape.circle,
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Text(
-                          'Lon: ${_currentLocation!.longitude.toStringAsFixed(5)}',
+                          'GPS: ${_currentLocation!.latitude.toStringAsFixed(4)}, ${_currentLocation!.longitude.toStringAsFixed(4)}',
                           style: const TextStyle(fontSize: 10),
                         ),
                       ],
@@ -669,55 +691,27 @@ class _MapScreenState extends State<MapScreen> {
             ),
           ),
 
-          // Pedestrian spawning control (bottom-right)
+          // Floating action buttons for spawning
           Positioned(
             bottom: 16,
             right: 16,
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                // Spawn near location button
                 FloatingActionButton.extended(
-                  onPressed: () async {
-                    if (_currentLocation != null) {
-                      _showMsg('👥 Spawning pedestrians NEAR your location...');
-                      _staticPedestrianManager.clearPedestrians();
-                      _staticPedestrianManager.spawnPedestriansNearYourLocation(_currentLocation!, 3);
-                      
-                      // Calculate and show distances immediately
-                      await Future.delayed(const Duration(milliseconds: 100));
-                      await _staticPedestrianManager.detectPedestriansFromVehicle(_currentLocation!);
-                      
-                      setState(() {});
-                      _showMsg('✓ Spawned ${_staticPedestrianManager.pedestrians.length} pedestrians near you!');
-                      
-                      // Show distance details
-                      for (final ped in _staticPedestrianManager.pedestrians) {
-                        if (ped.lastDetectionDistance != null) {
-                          _showMsg('📍 ${ped.id}: ${ped.lastDetectionDistance!.toStringAsFixed(0)}m away');
-                        }
-                      }
-                    } else {
-                      _showMsg('⚠️ Waiting for GPS location...');
-                    }
-                  },
+                  heroTag: 'spawn1',
+                  onPressed: _spawnProxyPedestrian,
                   backgroundColor: Colors.green,
-                  icon: const Icon(Icons.location_on),
-                  label: const Text('Near Me'),
+                  icon: const Icon(Icons.person_add),
+                  label: const Text('Add 1'),
                 ),
                 const SizedBox(height: 12),
-                // Random spawn button (original)
                 FloatingActionButton.extended(
-                  onPressed: () async {
-                    _showMsg('👥 Spawning random pedestrians on roads...');
-                    _staticPedestrianManager.clearPedestrians();
-                    _staticPedestrianManager.spawnStaticPedestrians(5);
-                    setState(() {});
-                    _showMsg('✓ Spawned ${_staticPedestrianManager.pedestrians.length} pedestrians randomly');
-                  },
+                  heroTag: 'spawn5',
+                  onPressed: () => _spawnMultiplePedestrians(5),
                   backgroundColor: Colors.orange,
-                  icon: const Icon(Icons.shuffle),
-                  label: const Text('Random'),
+                  icon: const Icon(Icons.group_add),
+                  label: const Text('Add 5'),
                 ),
               ],
             ),
@@ -726,4 +720,23 @@ class _MapScreenState extends State<MapScreen> {
       ),
     );
   }
+}
+
+// Alert data class
+class PedestrianAlertData {
+  final String pedestrianId;
+  final LatLng pedestrianLocation;
+  final double distanceMeters;
+  final double durationSeconds;
+  final DateTime detectionTime;
+  final bool isNew;
+
+  PedestrianAlertData({
+    required this.pedestrianId,
+    required this.pedestrianLocation,
+    required this.distanceMeters,
+    required this.durationSeconds,
+    required this.detectionTime,
+    required this.isNew,
+  });
 }

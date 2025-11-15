@@ -1,18 +1,18 @@
+// lib/services/static_pedestrian_manager.dart
 import 'package:latlong2/latlong.dart';
 import 'package:flutter/foundation.dart';
 import 'dart:math' as math;
+import 'dart:async';
 import '../models/StaticPedestrian.dart';
 import '../models/RealWorldRoadNetwork.dart';
 import '../utils/realistic_astar_pathfinder.dart';
-import 'dart:async';
 
-/// Alert triggered when pedestrian detected within threshold
 class PedestrianAlert {
   final String pedestrianId;
   final LatLng pedestrianLocation;
-  final double distanceMetersToCollision; // Distance via roads
+  final double distanceMetersToCollision;
   final DateTime detectionTime;
-  final bool isNewAlert; // True if first detection this session
+  final bool isNewAlert;
 
   PedestrianAlert({
     required this.pedestrianId,
@@ -21,14 +21,8 @@ class PedestrianAlert {
     required this.detectionTime,
     required this.isNewAlert,
   });
-
-  @override
-  String toString() =>
-      'Alert: $pedestrianId at ${distanceMetersToCollision.toStringAsFixed(1)}m';
 }
 
-/// Manages static pedestrians positioned on roads
-/// Handles detection, distance calculation, and alert generation
 class StaticPedestrianManager {
   final List<StaticPedestrian> pedestrians = [];
   final RealWorldRoadNetwork roadNetwork;
@@ -36,14 +30,10 @@ class StaticPedestrianManager {
   final double mapBoundsLatMax;
   final double mapBoundsLonMin;
   final double mapBoundsLonMax;
-  final double collisionThresholdMeters; // Alert threshold
+  final double collisionThresholdMeters;
 
-  // Callbacks
   Function(PedestrianAlert)? onAlertTriggered;
   Function(List<StaticPedestrian>)? onPedestriansUpdated;
-
-  Timer? _detectionTimer;
-  static const int detectionIntervalMs = 500; // Check every 500ms
 
   StaticPedestrianManager({
     required this.roadNetwork,
@@ -51,163 +41,64 @@ class StaticPedestrianManager {
     required this.mapBoundsLatMax,
     required this.mapBoundsLonMin,
     required this.mapBoundsLonMax,
-    this.collisionThresholdMeters = 2000.0, // 2km default for real roads
+    this.collisionThresholdMeters = 2000.0,
   });
 
-  /// Spawn static pedestrians at random locations on the road network
+  /// Spawn random pedestrians on road network
   void spawnStaticPedestrians(int count) {
-    debugPrint('👥 Spawning $count static pedestrians on road network...');
+    debugPrint('👥 Spawning $count pedestrians...');
     final random = math.Random();
 
-    // Pick random nodes from the road network
     final nodeIds = roadNetwork.nodes.keys.toList();
     if (nodeIds.isEmpty) {
       debugPrint('⚠️ No nodes in road network');
       return;
     }
 
-    for (int i = 0; i < count && i < nodeIds.length; i++) {
+    for (int i = 0; i < count; i++) {
       final randomNodeId = nodeIds[random.nextInt(nodeIds.length)];
       final node = roadNetwork.nodes[randomNodeId]!;
 
       final ped = StaticPedestrian(
-        id: 'ped_static_${DateTime.now().millisecondsSinceEpoch}_$i',
+        id: 'ped_${DateTime.now().millisecondsSinceEpoch}_$i',
         roadLocation: node.location,
         isDetected: false,
       );
 
       pedestrians.add(ped);
-      debugPrint('🚨 $i: ${ped.id} spawned at ${node.name} (${node.location.latitude.toStringAsFixed(5)}, ${node.location.longitude.toStringAsFixed(5)})');
+      debugPrint('✅ Spawned ${ped.id} at ${node.name}');
     }
 
     onPedestriansUpdated?.call(pedestrians);
-    debugPrint('✓ Spawned ${pedestrians.length} static pedestrians on road network');
+    debugPrint('✓ Total pedestrians: ${pedestrians.length}');
   }
 
-  /// Spawn one guaranteed test pedestrian within threshold (for testing alerts)
-  void spawnTestPedestrianNearby(LatLng vehicleLocation) {
-    debugPrint('🧪 Spawning test pedestrian on road network...');
-
-    final random = math.Random();
-    final nodeIds = roadNetwork.nodes.keys.toList();
-
-    if (nodeIds.isEmpty) {
-      debugPrint('⚠️ No nodes in road network');
-      return;
-    }
-
-    // Pick a random node from the network
-    final selectedNode = nodeIds[random.nextInt(nodeIds.length)];
-    final testNode = roadNetwork.nodes[selectedNode]!;
-
-    final testPed = StaticPedestrian(
-      id: 'ped_test_${DateTime.now().millisecondsSinceEpoch}',
-      roadLocation: testNode.location,
-      isDetected: false,
-    );
-
-    pedestrians.add(testPed);
-    debugPrint(
-        '✓ Test pedestrian spawned at ${testNode.name}');
-    onPedestriansUpdated?.call(pedestrians);
-  }
-
-  /// Spawn pedestrians near your current location (within nearby nodes)
-  void spawnPedestriansNearYourLocation(LatLng currentLocation, int count) {
-    debugPrint('👥 Spawning $count pedestrians near your location (${currentLocation.latitude.toStringAsFixed(5)}, ${currentLocation.longitude.toStringAsFixed(5)})...');
-    
-    final random = math.Random();
-    
-    // Find the nearest node to your current location
-    final nearestNodeId = RealisticAStarPathfinder.findNearestNode(roadNetwork, currentLocation);
-    final nearestNode = roadNetwork.nodes[nearestNodeId];
-    
-    if (nearestNode == null) {
-      debugPrint('⚠️ Could not find nearest node to your location');
-      return;
-    }
-    
-    debugPrint('📍 Your nearest node: $nearestNodeId = ${nearestNode.name} (lat: ${nearestNode.location.latitude.toStringAsFixed(5)}, lon: ${nearestNode.location.longitude.toStringAsFixed(5)})');
-    
-    // Get all outgoing segments from the nearest node
-    final outgoingSegments = roadNetwork.getOutgoingSegments(nearestNodeId);
-    
-    if (outgoingSegments.isEmpty) {
-      debugPrint('⚠️ No connected roads from your nearest node');
-      return;
-    }
-    
-    debugPrint('🛣️ Found ${outgoingSegments.length} connected roads from your node');
-    
-    // Spawn pedestrians at the end nodes of nearby roads
-    for (int i = 0; i < count; i++) {
-      try {
-        // Pick a random connected road
-        final randomSegment = outgoingSegments[random.nextInt(outgoingSegments.length)];
-        final targetNodeId = randomSegment.toNodeId;
-        final targetNode = roadNetwork.nodes[targetNodeId];
-        
-        if (targetNode != null) {
-          final ped = StaticPedestrian(
-            id: 'ped_nearby_${DateTime.now().millisecondsSinceEpoch}_$i',
-            roadLocation: targetNode.location,
-            isDetected: false,
-          );
-          
-          pedestrians.add(ped);
-          debugPrint(
-            '🚨 [$i] ${ped.id}:');
-          debugPrint(
-            '    Location: ${targetNode.name} (${targetNode.location.latitude.toStringAsFixed(5)}, ${targetNode.location.longitude.toStringAsFixed(5)})');
-          debugPrint(
-            '    Expected distance via ${randomSegment.roadName}: ${randomSegment.distanceMeters.toStringAsFixed(0)}m');
-          debugPrint(
-            '    Segment: ${randomSegment.fromNodeId} -> ${randomSegment.toNodeId} (${randomSegment.speedLimitKmh} km/h, Traffic: ${randomSegment.trafficCondition})');
-        }
-      } catch (e) {
-        debugPrint('⚠️ Error spawning pedestrian $i: $e');
-      }
-    }
-    
-    onPedestriansUpdated?.call(pedestrians);
-    debugPrint('✓ Spawned ${pedestrians.length} pedestrians near your location');
-  }
-
-  /// Start detection loop - continuously checks vehicle location against pedestrians
-  void startDetectionLoop() {
-    _detectionTimer?.cancel();
-    debugPrint('🔍 Starting pedestrian detection loop...');
-
-    _detectionTimer =
-        Timer.periodic(Duration(milliseconds: detectionIntervalMs), (_) {
-      // Detection happens via detectPedestriansFromVehicle() call
-    });
-  }
-
-  /// Stop detection loop
-  void stopDetectionLoop() {
-    _detectionTimer?.cancel();
-    _detectionTimer = null;
-    debugPrint('🛑 Detection loop stopped');
-  }
-
-  /// Main detection: called when vehicle location updates
-  /// Uses A* to calculate actual driving distance to pedestrians
+  /// MAIN DETECTION: Calculate REAL road distance using A*
   Future<void> detectPedestriansFromVehicle(LatLng vehicleLocation) async {
+    if (pedestrians.isEmpty) {
+      debugPrint('⚠️ No pedestrians to detect');
+      return;
+    }
+
     try {
-      // Find vehicle's nearest node on road network
-      final vehicleNodeId = RealisticAStarPathfinder.findNearestNode(roadNetwork, vehicleLocation);
-      debugPrint('🔍 Vehicle at node: $vehicleNodeId, searching pedestrians...');
+      // Find vehicle's nearest road node
+      final vehicleNodeId = RealisticAStarPathfinder.findNearestNode(
+        roadNetwork,
+        vehicleLocation,
+      );
+      
+      final vehicleNode = roadNetwork.nodes[vehicleNodeId];
+      debugPrint('🚗 Vehicle at: ${vehicleNode?.name ?? vehicleNodeId}');
 
       for (final ped in pedestrians) {
         try {
-          // Find pedestrian's nearest node on road network
-          final pedNodeId = RealisticAStarPathfinder.findNearestNode(roadNetwork, ped.roadLocation);
+          // Find pedestrian's nearest road node
+          final pedNodeId = RealisticAStarPathfinder.findNearestNode(
+            roadNetwork,
+            ped.roadLocation,
+          );
 
-          debugPrint(
-              '🔍 Checking ${ped.id}: vehicle at $vehicleNodeId, ped at $pedNodeId');
-
-          // Calculate actual driving route using A*
+          // Calculate REAL driving distance using A*
           final pathResult = RealisticAStarPathfinder.findOptimalRoute(
             roadNetwork,
             vehicleNodeId,
@@ -215,17 +106,19 @@ class StaticPedestrianManager {
           );
 
           if (pathResult.found) {
+            // Store REAL distance
             ped.lastDetectionDistance = pathResult.totalDistanceMeters;
 
+            final distKm = pathResult.totalDistanceMeters / 1000.0;
             debugPrint(
-                '📍 ${ped.id}: ${pathResult.totalDistanceMeters.toStringAsFixed(0)}m via ${pathResult.nodeSequence.length} nodes (path: ${pathResult.nodeSequence.join(' -> ')}), ETA: ${pathResult.getTimeEstimate()}');
+              '📍 ${ped.id}: ${pathResult.totalDistanceMeters.toStringAsFixed(0)}m (${distKm.toStringAsFixed(2)}km) via ${pathResult.nodeSequence.length} nodes'
+            );
 
             // Check if within collision threshold
             if (pathResult.totalDistanceMeters <= collisionThresholdMeters) {
               final isNewAlert = !ped.isDetected;
               ped.isDetected = true;
 
-              // Generate alert with routing information
               final alert = PedestrianAlert(
                 pedestrianId: ped.id,
                 pedestrianLocation: ped.roadLocation,
@@ -234,36 +127,32 @@ class StaticPedestrianManager {
                 isNewAlert: isNewAlert,
               );
 
-              debugPrint(
-                  '🚨 COLLISION ALERT: ${alert.pedestrianId} at ${pathResult.totalDistanceMeters.toStringAsFixed(0)}m (${pathResult.getTimeEstimate()}) - NEW: $isNewAlert');
+              debugPrint('🚨 ALERT: ${ped.id} at ${pathResult.totalDistanceMeters.toStringAsFixed(0)}m');
               onAlertTriggered?.call(alert);
-            } else if (ped.isDetected && pathResult.totalDistanceMeters > collisionThresholdMeters) {
-              // Pedestrian moved out of range
+            } else if (ped.isDetected) {
+              // Clear alert if pedestrian moves out of range
               ped.isDetected = false;
-              debugPrint(
-                  '✓ ${ped.id} out of detection range (${pathResult.totalDistanceMeters.toStringAsFixed(0)}m > ${collisionThresholdMeters.toStringAsFixed(0)}m)');
+              debugPrint('✓ ${ped.id} out of range');
             }
           } else {
-            debugPrint(
-                '⚠️ ${ped.id}: No driving route available (from $vehicleNodeId to $pedNodeId)');
+            debugPrint('⚠️ ${ped.id}: No route found');
+            ped.lastDetectionDistance = null;
             if (ped.isDetected) {
               ped.isDetected = false;
             }
           }
         } catch (e) {
-          debugPrint(
-              '❌ Error detecting ${ped.id}: $e');
+          debugPrint('❌ Error with ${ped.id}: $e');
         }
       }
 
-      // Update UI
       onPedestriansUpdated?.call(pedestrians);
     } catch (e) {
       debugPrint('❌ Detection error: $e');
     }
   }
 
-  /// Get all currently detected pedestrians (within threshold)
+  /// Get detected pedestrians
   List<StaticPedestrian> getDetectedPedestrians() {
     return pedestrians.where((ped) => ped.isDetected).toList();
   }
@@ -275,8 +164,7 @@ class StaticPedestrianManager {
     debugPrint('🗑️ Cleared all pedestrians');
   }
 
-  /// Dispose resources
   void dispose() {
-    stopDetectionLoop();
+    // Nothing to dispose
   }
 }
