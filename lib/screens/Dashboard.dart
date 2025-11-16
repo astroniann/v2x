@@ -1,3 +1,5 @@
+// lib/screens/Dashboard.dart
+// COMPLETE FILE - REPLACE ENTIRELY (LAYOUT FIXED)
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
@@ -5,8 +7,10 @@ import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
 
 import '../services/api_service.dart';
+import '../services/optimized_distance_service.dart';
 import '../models/RSU.dart' as rsu;
 import '../models/StaticPedestrian.dart';
+import '../utils/astar_pathfinder.dart';
 
 class MapScreen extends StatefulWidget {
   const MapScreen({super.key});
@@ -18,17 +22,20 @@ class MapScreen extends StatefulWidget {
 class _MapScreenState extends State<MapScreen> {
   LatLng? _currentLocation;
   late final MapController _mapController;
+  RouteData? _currentRoute;
+  List<LatLng> _routePoints = [];
   final ApiService _apiService = ApiService();
+  final OptimizedDistanceService _distanceService = OptimizedDistanceService();
 
-  // Pedestrians list
   final List<StaticPedestrian> _pedestrians = [];
   final List<PedestrianAlertData> _activeAlerts = [];
   
   StreamSubscription<Position>? _positionSub;
   Timer? _distanceCheckTimer;
+  Timer? _cacheCleanupTimer;
 
   final LatLng _fallbackCenter = const LatLng(23.0225, 72.5714);
-  static const double _collisionThresholdMeters = 2000.0; // 2km alert range
+  static const double _collisionThresholdMeters = 2000.0;
 
   @override
   void initState() {
@@ -36,22 +43,28 @@ class _MapScreenState extends State<MapScreen> {
     _mapController = MapController();
     _initLocation();
     _fetchPedestriansFromBackend();
+    _startCacheCleanup();
   }
 
   @override
   void dispose() {
     _positionSub?.cancel();
     _distanceCheckTimer?.cancel();
+    _cacheCleanupTimer?.cancel();
     super.dispose();
   }
 
-  // Initialize GPS location
+  void _startCacheCleanup() {
+    _cacheCleanupTimer = Timer.periodic(const Duration(minutes: 1), (_) {
+      _distanceService.cleanCache();
+    });
+  }
+
   Future<void> _initLocation() async {
     final hasPermission = await _handleLocationPermission();
     if (!hasPermission) return;
 
     try {
-      // Get initial position
       final pos = await Geolocator.getCurrentPosition(
         locationSettings: const LocationSettings(
           accuracy: LocationAccuracy.high,
@@ -65,12 +78,10 @@ class _MapScreenState extends State<MapScreen> {
 
       debugPrint('✅ Initial location: ${pos.latitude}, ${pos.longitude}');
 
-      // Center map on user location
       WidgetsBinding.instance.addPostFrameCallback((_) {
         _mapController.move(_currentLocation!, 15);
       });
 
-      // Start distance checking
       _startDistanceChecking();
 
     } catch (e) {
@@ -83,11 +94,10 @@ class _MapScreenState extends State<MapScreen> {
       });
     }
 
-    // Live GPS tracking
     _positionSub = Geolocator.getPositionStream(
       locationSettings: const LocationSettings(
         accuracy: LocationAccuracy.high,
-        distanceFilter: 5, // Update every 5 meters
+        distanceFilter: 5,
       ),
     ).listen((Position position) {
       debugPrint('📍 GPS Update: ${position.latitude}, ${position.longitude}');
@@ -98,10 +108,8 @@ class _MapScreenState extends State<MapScreen> {
         _currentLocation = newLoc;
       });
 
-      // Send location to backend
       _apiService.updateLocation(position.latitude, position.longitude);
 
-      // Update map
       WidgetsBinding.instance.addPostFrameCallback((_) {
         try {
           _mapController.move(newLoc, _mapController.camera.zoom);
@@ -112,7 +120,6 @@ class _MapScreenState extends State<MapScreen> {
     });
   }
 
-  // Handle location permissions
   Future<bool> _handleLocationPermission() async {
     final serviceEnabled = await Geolocator.isLocationServiceEnabled();
     if (!serviceEnabled) {
@@ -138,7 +145,6 @@ class _MapScreenState extends State<MapScreen> {
     return true;
   }
 
-  // Fetch pedestrians from backend
   Future<void> _fetchPedestriansFromBackend() async {
     try {
       final List<rsu.Pedestrian> data = await _apiService.fetchPedestrians();
@@ -155,7 +161,6 @@ class _MapScreenState extends State<MapScreen> {
         }
       });
 
-      // Start checking distances
       if (_currentLocation != null) {
         _checkAllPedestrianDistances();
       }
@@ -164,23 +169,20 @@ class _MapScreenState extends State<MapScreen> {
     }
   }
 
-  // Spawn proxy pedestrian on map (for testing)
   Future<void> _spawnProxyPedestrian() async {
     if (_currentLocation == null) {
       debugPrint('⚠️ Current location not available');
       return;
     }
 
-    // Create a pedestrian at a random nearby location (within ~5km)
     final random = (DateTime.now().millisecondsSinceEpoch % 1000) / 1000.0;
-    final offset = (random - 0.5) * 0.05; // Random offset
+    final offset = (random - 0.5) * 0.05;
     
     final testLat = _currentLocation!.latitude + offset;
     final testLon = _currentLocation!.longitude + offset;
 
     final testLocation = LatLng(testLat, testLon);
 
-    // Snap to nearest road
     debugPrint('📍 Spawning pedestrian near (${testLat.toStringAsFixed(5)}, ${testLon.toStringAsFixed(5)})');
     final snappedLocation = await _apiService.snapToRoad(testLocation);
     final finalLocation = snappedLocation ?? testLocation;
@@ -197,11 +199,56 @@ class _MapScreenState extends State<MapScreen> {
 
     debugPrint('✅ Spawned pedestrian at (${finalLocation.latitude.toStringAsFixed(5)}, ${finalLocation.longitude.toStringAsFixed(5)})');
 
-    // Calculate distance immediately
-    await _checkPedestrianDistance(proxyPed);
+    await _checkAllPedestrianDistances();
   }
 
-  // Spawn multiple pedestrians
+  Future<void> _showRouteToPedestrian(StaticPedestrian ped) async {
+    if (_currentLocation == null) return;
+
+    try {
+      final route = await AStarPathfinder.getRoute(_currentLocation!, ped.roadLocation);
+      if (route.distanceMeters.isFinite && route.waypoints.isNotEmpty) {
+        setState(() {
+          _currentRoute = route;
+          _routePoints = route.waypoints;
+        });
+
+        // Try to center the map on the route bounds (fitBounds not available).
+        try {
+          final bounds = LatLngBounds.fromPoints(_routePoints);
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            try {
+              // Compute simple center from bounds
+              final lats = _routePoints.map((p) => p.latitude).toList();
+              final lons = _routePoints.map((p) => p.longitude).toList();
+              final minLat = lats.reduce((a, b) => a < b ? a : b);
+              final maxLat = lats.reduce((a, b) => a > b ? a : b);
+              final minLon = lons.reduce((a, b) => a < b ? a : b);
+              final maxLon = lons.reduce((a, b) => a > b ? a : b);
+              final center = LatLng((minLat + maxLat) / 2.0, (minLon + maxLon) / 2.0);
+              _mapController.move(center, _mapController.camera.zoom);
+            } catch (e) {
+              debugPrint('Centering route error: $e');
+            }
+          });
+        } catch (e) {
+          debugPrint('Fit bounds error: $e');
+        }
+      } else {
+        debugPrint('No valid route returned');
+      }
+    } catch (e) {
+      debugPrint('Error fetching route: $e');
+    }
+  }
+
+  void _clearRoute() {
+    setState(() {
+      _currentRoute = null;
+      _routePoints = [];
+    });
+  }
+
   Future<void> _spawnMultiplePedestrians(int count) async {
     if (_currentLocation == null) {
       debugPrint('⚠️ Current location not available');
@@ -212,94 +259,80 @@ class _MapScreenState extends State<MapScreen> {
     
     for (int i = 0; i < count; i++) {
       await _spawnProxyPedestrian();
-      // Small delay to avoid rate limiting
       await Future.delayed(const Duration(milliseconds: 200));
     }
     
     debugPrint('✅ Spawned $count pedestrians');
   }
 
-  // Start periodic distance checking (every 2 seconds)
   void _startDistanceChecking() {
     _distanceCheckTimer?.cancel();
-    _distanceCheckTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+    _distanceCheckTimer = Timer.periodic(const Duration(seconds: 5), (_) {
       if (_currentLocation != null) {
         _checkAllPedestrianDistances();
       }
     });
   }
 
-  // Check distance to all pedestrians using REAL API
   Future<void> _checkAllPedestrianDistances() async {
     if (_currentLocation == null || _pedestrians.isEmpty) return;
 
     debugPrint('🔍 Checking distances to ${_pedestrians.length} pedestrians...');
 
-    for (final ped in _pedestrians) {
-      await _checkPedestrianDistance(ped);
-    }
-  }
-
-  // Check distance to single pedestrian using REAL OSRM API
-  Future<void> _checkPedestrianDistance(StaticPedestrian ped) async {
-    if (_currentLocation == null) return;
-
     try {
-      // Calculate REAL road distance using OSRM API
-      final proximityResult = await _apiService.checkPedestrianProximity(
+      final pedestrianLocations = _pedestrians.map((ped) => 
+        PedestrianLocation(id: ped.id, location: ped.roadLocation)
+      ).toList();
+
+      final distances = await _distanceService.calculateDistancesToMultiplePedestrians(
         _currentLocation!,
-        ped.roadLocation,
-        _collisionThresholdMeters,
+        pedestrianLocations,
       );
 
-      if (proximityResult.error != null) {
-        debugPrint('⚠️ ${ped.id}: ${proximityResult.error}');
-        return;
-      }
-
-      // Update pedestrian data
       setState(() {
-        ped.lastDetectionDistance = proximityResult.distanceMeters;
+        for (final ped in _pedestrians) {
+          final distance = distances[ped.id];
+          
+          if (distance != null) {
+            ped.lastDetectionDistance = distance;
 
-        if (proximityResult.isNearby) {
-          // Pedestrian is within threshold - ALERT!
-          if (!ped.isDetected) {
-            // New alert
-            ped.isDetected = true;
-            
-            final alert = PedestrianAlertData(
-              pedestrianId: ped.id,
-              pedestrianLocation: ped.roadLocation,
-              distanceMeters: proximityResult.distanceMeters,
-              durationSeconds: proximityResult.durationSeconds,
-              detectionTime: DateTime.now(),
-              isNew: true,
-            );
+            if (distance <= _collisionThresholdMeters) {
+              if (!ped.isDetected) {
+                ped.isDetected = true;
+                
+                final alert = PedestrianAlertData(
+                  pedestrianId: ped.id,
+                  pedestrianLocation: ped.roadLocation,
+                  distanceMeters: distance,
+                  durationSeconds: distance / 15.0,
+                  detectionTime: DateTime.now(),
+                  isNew: true,
+                );
 
-            _activeAlerts.insert(0, alert);
-            if (_activeAlerts.length > 10) {
-              _activeAlerts.removeLast();
+                _activeAlerts.insert(0, alert);
+                if (_activeAlerts.length > 10) {
+                  _activeAlerts.removeLast();
+                }
+
+                _apiService.updatePedestrian(
+                  ped.roadLocation.latitude,
+                  ped.roadLocation.longitude,
+                  pedestrianId: ped.id,
+                );
+
+                debugPrint('🚨 NEW ALERT: ${ped.id} at ${distance.toStringAsFixed(0)}m');
+              }
+            } else {
+              if (ped.isDetected) {
+                ped.isDetected = false;
+                debugPrint('✓ ${ped.id} moved out of range');
+              }
             }
-
-            // Send alert to backend
-            _apiService.updatePedestrian(
-              ped.roadLocation.latitude,
-              ped.roadLocation.longitude,
-              pedestrianId: ped.id,
-            );
-
-            debugPrint('🚨 NEW ALERT: ${ped.id} at ${proximityResult.distanceMeters.toStringAsFixed(0)}m');
-          }
-        } else {
-          // Pedestrian is far - clear alert
-          if (ped.isDetected) {
-            ped.isDetected = false;
-            debugPrint('✓ ${ped.id} moved out of range');
           }
         }
       });
     } catch (e) {
-      debugPrint('❌ Error checking ${ped.id}: $e');
+      debugPrint('❌ Error checking distances: $e');
     }
   }
 
@@ -326,12 +359,18 @@ class _MapScreenState extends State<MapScreen> {
             onPressed: _fetchPedestriansFromBackend,
           ),
           IconButton(
+            icon: const Icon(Icons.directions),
+            tooltip: 'Clear Route',
+            onPressed: _clearRoute,
+          ),
+          IconButton(
             icon: const Icon(Icons.delete_sweep),
             tooltip: 'Clear All',
             onPressed: () {
               setState(() {
                 _pedestrians.clear();
                 _activeAlerts.clear();
+                _distanceService.clearCache();
               });
             },
           ),
@@ -340,7 +379,6 @@ class _MapScreenState extends State<MapScreen> {
 
       body: Stack(
         children: [
-          // Map
           FlutterMap(
             mapController: _mapController,
             options: MapOptions(
@@ -350,12 +388,23 @@ class _MapScreenState extends State<MapScreen> {
             children: [
               TileLayer(
                 urlTemplate: "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
-                subdomains: ['a', 'b', 'c'],
+                subdomains: const ['a', 'b', 'c'],
               ),
+
+              // Route polyline layer (A* route)
+              if (_routePoints.isNotEmpty)
+                PolylineLayer(
+                  polylines: [
+                    Polyline(
+                      points: _routePoints,
+                      color: Colors.blue.shade700,
+                      strokeWidth: 4.0,
+                    ),
+                  ],
+                ),
 
               MarkerLayer(
                 markers: [
-                  // Vehicle marker
                   if (_currentLocation != null)
                     Marker(
                       width: 60,
@@ -380,7 +429,6 @@ class _MapScreenState extends State<MapScreen> {
                       ),
                     ),
 
-                  // Pedestrian markers
                   ..._pedestrians.map((ped) {
                     final isDetected = ped.isDetected;
                     final distance = ped.lastDetectionDistance ?? double.infinity;
@@ -389,10 +437,11 @@ class _MapScreenState extends State<MapScreen> {
                       width: 60,
                       height: 60,
                       point: ped.roadLocation,
-                      child: Stack(
+                      child: GestureDetector(
+                        onTap: () => _showRouteToPedestrian(ped),
+                        child: Stack(
                         alignment: Alignment.center,
                         children: [
-                          // Alert ring
                           if (isDetected)
                             Container(
                               width: 60,
@@ -409,7 +458,6 @@ class _MapScreenState extends State<MapScreen> {
                                 ],
                               ),
                             ),
-                          // Pedestrian icon
                           Container(
                             width: 45,
                             height: 45,
@@ -423,7 +471,6 @@ class _MapScreenState extends State<MapScreen> {
                               size: 26,
                             ),
                           ),
-                          // Distance badge
                           if (distance != double.infinity)
                             Positioned(
                               bottom: -5,
@@ -446,16 +493,16 @@ class _MapScreenState extends State<MapScreen> {
                                 ),
                               ),
                             ),
-                        ],
+                          ],
+                        ),
                       ),
-                    );
+                      );
                   }),
                 ],
               ),
             ],
           ),
 
-          // Alert panel
           Positioned(
             top: 16,
             right: 16,
@@ -603,11 +650,14 @@ class _MapScreenState extends State<MapScreen> {
             ),
           ),
 
-          // Stats panel
+          // FIXED: Stats panel with proper constraints
           Positioned(
             bottom: 16,
             left: 16,
             child: Container(
+              constraints: const BoxConstraints(
+                maxWidth: 280, // ADDED: Maximum width constraint
+              ),
               decoration: BoxDecoration(
                 color: Colors.white,
                 borderRadius: BorderRadius.circular(12),
@@ -631,7 +681,9 @@ class _MapScreenState extends State<MapScreen> {
                     ),
                   ),
                   const SizedBox(height: 8),
+                  // Pedestrian count row
                   Row(
+                    mainAxisSize: MainAxisSize.min, // ADDED: Prevent overflow
                     children: [
                       Container(
                         width: 12,
@@ -649,26 +701,37 @@ class _MapScreenState extends State<MapScreen> {
                     ],
                   ),
                   const SizedBox(height: 6),
+                  // Status info row - FIXED with proper wrapping
                   Row(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Container(
                         width: 12,
                         height: 12,
+                        margin: const EdgeInsets.only(top: 2), // Align with text
                         decoration: const BoxDecoration(
                           color: Colors.orange,
                           shape: BoxShape.circle,
                         ),
                       ),
                       const SizedBox(width: 8),
-                      const Text(
-                        'Using: OSRM Real Distance API',
-                        style: TextStyle(fontSize: 11),
+                      Flexible(
+                        child: Text(
+                          _distanceService.getStatusInfo(),
+                          style: const TextStyle(fontSize: 9),
+                          maxLines: 2, // ADDED: Allow 2 lines
+                          overflow: TextOverflow.ellipsis,
+                          softWrap: true, // ADDED: Enable wrapping
+                        ),
                       ),
                     ],
                   ),
+                  // GPS coordinates row
                   if (_currentLocation != null) ...[
                     const SizedBox(height: 6),
                     Row(
+                      mainAxisSize: MainAxisSize.min,
                       children: [
                         Container(
                           width: 12,
@@ -679,9 +742,13 @@ class _MapScreenState extends State<MapScreen> {
                           ),
                         ),
                         const SizedBox(width: 8),
-                        Text(
-                          'GPS: ${_currentLocation!.latitude.toStringAsFixed(4)}, ${_currentLocation!.longitude.toStringAsFixed(4)}',
-                          style: const TextStyle(fontSize: 10),
+                        Flexible(
+                          child: Text(
+                            'GPS: ${_currentLocation!.latitude.toStringAsFixed(4)}, ${_currentLocation!.longitude.toStringAsFixed(4)}',
+                            style: const TextStyle(fontSize: 9),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
                         ),
                       ],
                     ),
@@ -691,7 +758,6 @@ class _MapScreenState extends State<MapScreen> {
             ),
           ),
 
-          // Floating action buttons for spawning
           Positioned(
             bottom: 16,
             right: 16,
@@ -722,7 +788,6 @@ class _MapScreenState extends State<MapScreen> {
   }
 }
 
-// Alert data class
 class PedestrianAlertData {
   final String pedestrianId;
   final LatLng pedestrianLocation;
